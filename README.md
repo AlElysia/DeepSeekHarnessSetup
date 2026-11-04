@@ -83,7 +83,7 @@ powershell -ExecutionPolicy Bypass -File .\DeepSeek-Harness-Setup.ps1
 
 - 脚本文件必须保持 **UTF-8 with BOM** 编码，否则 PowerShell 5.1 下中文会乱码
 - 第三方插件 / Skill 风险自负，与作者无关
-- 工作目录为 `%USERPROFILE%`，数据目录为 `%USERPROFILE%\.dsh`（DeepSeek Harness 官方约定）
+- 工作目录为 `%USERPROFILE%`，数据目录为 `%USERPROFILE%\.dsh`
 
 ## 许可证
 
