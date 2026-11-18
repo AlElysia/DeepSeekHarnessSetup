@@ -94,20 +94,6 @@ function Add-UserPath {
     Write-Host "已添加用户环境变量 PATH：$Dir（重新打开终端后生效）"
 }
 
-# 设置用户级环境变量（同时刷新当前会话）
-function Set-UserEnvVar {
-    param([string]$Name, [string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Name) -or [string]::IsNullOrWhiteSpace($Value)) { return }
-    $old = [Environment]::GetEnvironmentVariable($Name, "User")
-    [Environment]::SetEnvironmentVariable($Name, $Value, "User")
-    Set-Item -Path "Env:$Name" -Value $Value -ErrorAction SilentlyContinue
-    if ($old -and $old -ne $Value) {
-        Write-Host "已更新用户环境变量 $Name：$old -> $Value"
-    } else {
-        Write-Host "已设置用户环境变量 $Name：$Value"
-    }
-}
-
 # 比较两个路径是否等价（忽略大小写、引号与结尾反斜杠）
 function Test-SamePath {
     param([string]$A, [string]$B)
@@ -307,15 +293,21 @@ function Get-DefaultNpmPrefix {
     return $Script:DefaultNpmPrefix
 }
 
-# 把全局安装目录写进用户环境：bin 目录进 PATH，模块目录进 NODE_PATH
-# 安装 / 更新里自动调用，不再单独提供“配置 npm 系统环境”菜单项
+# 把全局安装目录写进用户环境：只需要 bin 目录进 PATH
+# NODE_PATH 是 Node 的旧版模块搜索路径，现代包按自身 node_modules 解析，dsh 也不读它，
+# 所以不再写入；旧版本写入过与本目录匹配的 NODE_PATH 时顺手清掉
 function Set-NpmEnvVars {
     param([string]$Dir)
     if ([string]::IsNullOrWhiteSpace($Dir)) { return }
-    $pkgRoot = Join-Path $Dir "node_modules"
     Add-UserPath -Dir $Dir
-    Set-UserEnvVar -Name "NODE_PATH" -Value $pkgRoot
-    Write-Host "npm 环境已同步：PATH=$Dir；NODE_PATH=$pkgRoot"
+    $legacyNodePath = Join-Path $Dir "node_modules"
+    $current = [Environment]::GetEnvironmentVariable("NODE_PATH", "User")
+    if ($current -and (Test-SamePath $current $legacyNodePath)) {
+        [Environment]::SetEnvironmentVariable("NODE_PATH", $null, "User")
+        Remove-Item Env:\NODE_PATH -ErrorAction SilentlyContinue
+        Write-Host "已移除旧版本写入的用户环境变量 NODE_PATH：$current（dsh 不依赖它）"
+    }
+    Write-Host "npm 环境已同步：PATH=$Dir"
 }
 
 # 定位 dsh 的安装目录（不依赖 PATH）：<dir>\node_modules\@deepseek-ai\dsh 存在即命中
@@ -485,7 +477,7 @@ function Install-DshDesktop {
 #   1) 一开始就问清楚装到哪：自定义目录（默认 C:\npm-global）或 npm 默认位置
 #   2) 绝不给 npm install 传 --prefix 参数（实测会损坏文件）
 #   3) 只有自定义目录才 npm config set prefix，装完恢复成安装前的 npm config
-#   4) 安装目录写入用户 PATH（全局 bin）与 NODE_PATH（全局 node_modules）
+#   4) 安装目录写入用户 PATH（全局 bin）；不写 NODE_PATH——dsh 只用自身 node_modules
 #   5) 安装不做 dsh 路径探测：装到哪个目录是已知的，直接按该目录给出运行命令
 #   6) pnpm 是共用工具，必须装在 npm 默认全局目录（切换 prefix 之前装）；已安装则直接跳过，
 #      既不重复安装，也不会跟着 dsh 的自定义目录跑掉
@@ -498,7 +490,7 @@ function Install-DshWeb {
     Write-Host ""
     Write-Host "描述：安装 DeepSeek-Harness Web $label。"
     Write-Host "流程：检查 Node.js -> 询问是否自定义安装目录 -> 允许包脚本 -> 检查 pnpm（默认目录，已装则跳过）->"
-    Write-Host "      自定义才 npm config set prefix -> 安装 dsh -> 恢复 npm config 原配置 -> 写入 PATH/NODE_PATH。"
+    Write-Host "      自定义才 npm config set prefix -> 安装 dsh -> 恢复 npm config 原配置 -> 安装目录写入用户 PATH。"
     if (-not (Ensure-NodeJs)) { Pause-Screen; return }
 
     # 先问清楚装到哪：自定义目录（默认 C:\npm-global）或 npm 默认位置
@@ -556,8 +548,7 @@ function Install-DshWeb {
         return
     }
 
-    # npm 系统环境随安装一起配置（不再单独提供设置项）：
-    # 全局 bin 目录进 PATH，全局模块目录进 NODE_PATH
+    # 安装完成后把全局 bin 目录写进用户 PATH（不再单独提供设置项）
     Set-NpmEnvVars -Dir $targetPrefix
 
     # 安装不做路径探测：装到哪个目录是已知的，直接按该目录给出结果
@@ -566,7 +557,7 @@ function Install-DshWeb {
     Write-Host "安装完成，安装目录：$targetPrefix"
     if ($ver) { Write-Host "已安装版本：$ver" }
     Write-Host "可直接运行：$targetPrefix\dsh.cmd web"
-    Write-Host "提示：重新打开终端后 PATH / NODE_PATH 才会完整生效。"
+    Write-Host "提示：重新打开终端后 PATH 才会完整生效。"
     Pause-Screen
 }
 
@@ -575,7 +566,7 @@ function Install-DshWeb {
 #   1) dsh 在 npm 默认全局目录时不需要探测，直接更新；只有装在自定义（非默认）目录，
 #      才去 Get-Command / 各全局目录的 node_modules\@deepseek-ai\dsh 里找，仍找不到再让用户输入目录
 #   2) 必须先把 npm prefix 切到该目录再 npm update -g；直接在 dsh 目录里更新只会 remove 掉文件，不会更新
-#   3) 更新完恢复 npm config 为更新前的配置，并同步 PATH / NODE_PATH
+#   3) 更新完恢复 npm config 为更新前的配置，并把安装目录同步进用户 PATH
 #   4) pnpm 属共用工具，更新 dsh 时不动它
 function Upgrade-DshWeb {
     Write-Host ""
@@ -669,7 +660,7 @@ function Upgrade-DshWeb {
         if ($Script:NpmPrefixTouched) { Restore-NpmPrefix }
     }
 
-    # npm 系统环境随更新一起同步（PATH / NODE_PATH 指向真实安装目录）
+    # 更新后把真实安装目录同步进用户 PATH
     Set-NpmEnvVars -Dir $prefix
 
     if (-not $ok) { Write-Host "更新未成功，请查看上方 npm 输出。" }
