@@ -24,8 +24,15 @@ $Script:ScriptAuthor = "@BLIDK"
 $Script:WingetDesktopId = "hongfeiyucode.DeepSeekHarnessDesktop"
 
 # npm 包名：Web 正式版 / Web 测试版（next 通道）
+$Script:DshPkgName   = "@deepseek-ai/dsh"
 $Script:DshPkgStable = "@deepseek-ai/dsh"
 $Script:DshPkgBeta   = "@deepseek-ai/dsh@next"
+
+# npm 全局安装目录默认值（自定义安装时使用；靠 npm config set prefix 生效，绝不给 install 传 --prefix）
+$Script:DefaultNpmPrefix = "C:\npm-global"
+
+# 安装 / 更新期间临时切换的 npm prefix 原值（结束后据此恢复）
+$Script:NpmPrefixBefore = $null
 
 # 目录约定：工作目录 %USERPROFILE%，DSH 数据目录 %USERPROFILE%\.dsh
 $Script:UserProfileDir = $env:USERPROFILE
@@ -85,6 +92,118 @@ function Add-UserPath {
     Write-Host "已添加用户环境变量 PATH：$Dir（重新打开终端后生效）"
 }
 
+# 设置用户级环境变量（同时刷新当前会话）
+function Set-UserEnvVar {
+    param([string]$Name, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Name) -or [string]::IsNullOrWhiteSpace($Value)) { return }
+    $old = [Environment]::GetEnvironmentVariable($Name, "User")
+    [Environment]::SetEnvironmentVariable($Name, $Value, "User")
+    Set-Item -Path "Env:$Name" -Value $Value -ErrorAction SilentlyContinue
+    if ($old -and $old -ne $Value) {
+        Write-Host "已更新用户环境变量 $Name：$old -> $Value"
+    } else {
+        Write-Host "已设置用户环境变量 $Name：$Value"
+    }
+}
+
+# 读取 npm 配置项（失败或未设置时返回 $null）
+function Get-NpmConfigValue {
+    param([string]$Key)
+    $out = & npm config get $Key 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $v = ([string](@($out) -join "")).Trim()
+    if ([string]::IsNullOrWhiteSpace($v) -or $v -eq "undefined" -or $v -eq "null") { return $null }
+    return $v
+}
+
+# 读取 npm 全局模块目录（npm root -g）
+function Get-NpmGlobalRoot {
+    $out = & npm root -g 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $v = ([string](@($out) -join "")).Trim()
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    return $v
+}
+
+# 读取 @deepseek-ai/dsh 已安装版本（从 <prefix>\node_modules 下的 package.json 读）
+function Get-DshInstalledVersion {
+    param([string]$PrefixDir)
+    if ([string]::IsNullOrWhiteSpace($PrefixDir)) { return $null }
+    $pkgJson = Join-Path $PrefixDir "node_modules\@deepseek-ai\dsh\package.json"
+    if (-not (Test-Path $pkgJson)) { return $null }
+    try {
+        $obj = Get-Content $pkgJson -Raw -ErrorAction Stop | ConvertFrom-Json
+        return $obj.version
+    } catch {
+        return $null
+    }
+}
+
+# 探测 dsh 命令真实位置：Get-Command -> 指定目录 -> 当前 npm prefix -> 默认目录 -> npm root -g 上一级
+function Find-DshCommand {
+    param([string]$PrefixDir)
+    $cmd = Get-Command dsh -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) {
+        # 同目录下优先用 .cmd 包装器（比 .ps1 少受执行策略影响）
+        $cmdDir  = Split-Path $cmd.Source -Parent
+        $cmdFile = Join-Path $cmdDir "dsh.cmd"
+        if (Test-Path $cmdFile) { return $cmdFile }
+        return $cmd.Source
+    }
+
+    $dirs = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($PrefixDir)) { $dirs.Add($PrefixDir) }
+    $npmPrefix = Get-NpmConfigValue "prefix"
+    if ($npmPrefix) { $dirs.Add($npmPrefix) }
+    $dirs.Add($Script:DefaultNpmPrefix)
+    $npmRoot = Get-NpmGlobalRoot
+    if ($npmRoot) { $dirs.Add((Split-Path $npmRoot -Parent)) }
+
+    foreach ($dir in $dirs) {
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        foreach ($name in @("dsh.cmd", "dsh.exe", "dsh.ps1", "dsh")) {
+            $cand = Join-Path $dir $name
+            if (Test-Path $cand) { return $cand }
+        }
+    }
+    return $null
+}
+
+# 临时把 npm prefix 切到指定目录（等于 npm config set prefix），原值存入 $Script:NpmPrefixBefore
+function Set-NpmPrefixTemporary {
+    param([string]$Prefix)
+    if ([string]::IsNullOrWhiteSpace($Prefix)) { return $false }
+    $Script:NpmPrefixBefore = Get-NpmConfigValue "prefix"
+    if (-not (Test-Path $Prefix)) {
+        New-Item -ItemType Directory -Path $Prefix -Force | Out-Null
+        Write-Host "已创建安装目录：$Prefix"
+    }
+    Write-Host "正在设置 npm prefix：$Prefix"
+    & npm config set prefix "$Prefix" 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "警告：npm config set prefix 返回码 $LASTEXITCODE。"
+    }
+    $now = Get-NpmConfigValue "prefix"
+    Write-Host "当前 npm prefix：$now"
+    if (-not $now) { return $false }
+    return ($now.TrimEnd('\') -ieq $Prefix.TrimEnd('\'))
+}
+
+# 恢复安装 / 更新前的 npm prefix（用户级无配置时等价于 npm config delete prefix）
+function Restore-NpmPrefix {
+    $before = $Script:NpmPrefixBefore
+    Write-Host "正在恢复 npm prefix（npm config delete prefix）……"
+    & npm config delete prefix 2>$null | Out-Null
+    $now = Get-NpmConfigValue "prefix"
+    if ($before -and $now -and ($now.TrimEnd('\') -ine $before.TrimEnd('\'))) {
+        & npm config set prefix "$before" 2>$null | Out-Null
+        Write-Host "已恢复原有 npm prefix：$before"
+    } else {
+        Write-Host "npm prefix 已恢复默认：$now"
+    }
+    $Script:NpmPrefixBefore = $null
+}
+
 # ============================ 菜单显示 ============================
 
 function Show-MainMenu {
@@ -112,11 +231,13 @@ function Show-MainMenu {
     Write-Host "  4. DeepSeek-Harness Desktop Management  (Plugins)"
     Write-Host "  5. DeepSeek-Harness Web Management      (Plugins)"
     Write-Host "  6. DeepSeek-Harness Skill Management"
-    Write-Host "  7. Start DSH Web"
-    Write-Host "  8. Quit"
+    Write-Host "  7. Upgrade DSH Web                      (npm update -g)"
+    Write-Host "  8. Configure npm Global Environment     (prefix / PATH / NODE_PATH)"
+    Write-Host "  9. Start DSH Web"
+    Write-Host "  0. Quit"
     Write-Host ""
     Write-Host "------------------------------------------------------------"
-    Write-Host "键盘输入提示：输入编号 [1-8] 选择功能；输入 q 退出脚本。"
+    Write-Host "键盘输入提示：输入编号 [1-9 / 0] 选择功能；输入 q 退出脚本。"
 }
 
 function Show-ProfileMenu {
@@ -223,102 +344,245 @@ function Install-DshDesktop {
     Pause-Screen
 }
 
-# 主菜单 2：安装 DeepSeek-Harness Web 正式版
-function Install-DshWebStable {
+# 主菜单 2 / 3：安装 DeepSeek-Harness Web（正式版 / 测试版）
+# 流程约定（见 docs/12.md）：
+#   1) 绝不给 npm install 传 --prefix 参数（实测会损坏文件）
+#   2) 先用 npm config set prefix 把全局目录切到目标位置，装完再 npm config delete prefix 恢复
+#   3) 装完用 Get-Command dsh 探测命令位置，探测不到再让用户手动输入
+#   4) 自定义目录同时写入用户 PATH（全局 bin）与 NODE_PATH（全局 node_modules）
+function Install-DshWeb {
+    param([ValidateSet("stable", "beta")][string]$Channel = "stable")
+
+    $label   = if ($Channel -eq "beta") { "测试版（next 通道，不稳定）" } else { "正式版" }
+    $pkgSpec = if ($Channel -eq "beta") { $Script:DshPkgBeta } else { $Script:DshPkgStable }
+
     Write-Host ""
-    Write-Host "描述：安装 DeepSeek-Harness Web 正式版（性能较好，可用）。"
-    Write-Host "流程：检查 Node.js -> 允许包脚本 -> 安装 pnpm -> npx 启动。"
+    Write-Host "描述：安装 DeepSeek-Harness Web $label。"
+    Write-Host "流程：检查 Node.js -> 允许包脚本 -> 选择安装目录 -> npm config set prefix ->"
+    Write-Host "      安装 pnpm 与 dsh -> npm config delete prefix -> 探测 dsh 位置 -> 写入 PATH/NODE_PATH。"
     if (-not (Ensure-NodeJs)) { Pause-Screen; return }
 
     if (-not (Read-YesNo "是否允许执行 @pnpm 和 @deepseek-ai/dsh 两个包的安装脚本？")) {
         Write-Host "已拒绝执行包脚本，返回主菜单（不安装）。"
+        Pause-Screen
         return
     }
     Set-NpmAllowScripts
 
-    Write-Host "正在安装 pnpm（npm install -g pnpm）……"
-    & npm install -g pnpm
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "pnpm 安装失败（退出码 $LASTEXITCODE）。"
-        Pause-Screen
-        return
+    # 安装目录：自定义目录（默认 C:\npm-global）或 npm 默认位置
+    $prefixDir = $null
+    if (Read-YesNo "是否使用自定义安装目录（默认 $Script:DefaultNpmPrefix，n 表示使用 npm 默认位置）？") {
+        $inputDir = (Read-Host "请输入安装目录（直接回车使用 $Script:DefaultNpmPrefix）").Trim().Trim('"').Trim()
+        $prefixDir = if ([string]::IsNullOrWhiteSpace($inputDir)) { $Script:DefaultNpmPrefix } else { $inputDir }
     }
 
-    Write-Host ""
-    Write-Host "正在启动 DeepSeek-Harness Web 正式版（npx @deepseek-ai/dsh web）……"
-    Write-Host "提示：在浏览器打开脚本提示的地址即可使用；按 Ctrl+C 可停止并返回本脚本。"
-    & npx -y "@deepseek-ai/dsh" web
-    Pause-Screen
-}
-
-# 主菜单 3：安装 DeepSeek-Harness Web 测试版
-function Install-DshWebBeta {
-    Write-Host ""
-    Write-Host "描述：安装 DeepSeek-Harness Web 测试版（不推荐，不稳定，next 通道）。"
-    Write-Host "流程：检查 Node.js -> 允许包脚本 -> 选择全局/自定义目录 -> 安装。"
-    if (-not (Ensure-NodeJs)) { Pause-Screen; return }
-
-    if (-not (Read-YesNo "是否允许执行 @pnpm 和 @deepseek-ai/dsh 两个包的安装脚本？")) {
-        Write-Host "已拒绝执行包脚本，返回主菜单（不安装）。"
-        return
-    }
-
-    # 全局安装 或 自定义目录（--prefix）
-    $useGlobal = Read-YesNo "@deepseek-ai/dsh 是否全局安装？(y=全局安装 / n=自定义目录)"
-    $customDir = $null
-    if (-not $useGlobal) {
-        $customDir = (Read-Host "请输入自定义安装目录（例如 D:\dsh-global）").Trim().Trim('"').Trim()
-        if ([string]::IsNullOrWhiteSpace($customDir)) {
-            Write-Host "目录为空，已取消，返回主菜单。"
-            return
+    $switched = $false
+    if ($prefixDir) {
+        # 关键：只用 npm config set prefix，绝不给 install 加 --prefix
+        $switched = Set-NpmPrefixTemporary -Prefix $prefixDir
+        if (-not $switched) {
+            Write-Host "警告：npm prefix 可能未切到 $prefixDir，仍按当前 prefix 继续安装。"
         }
+        # npm 系统环境：全局 bin 目录进 PATH，全局模块目录进 NODE_PATH
+        Add-UserPath -Dir $prefixDir
+        Set-UserEnvVar -Name "NODE_PATH" -Value (Join-Path $prefixDir "node_modules")
     }
 
-    Set-NpmAllowScripts
-
-    Write-Host "正在安装 pnpm（npm install -g pnpm）……"
-    & npm install -g pnpm
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "pnpm 安装失败（退出码 $LASTEXITCODE）。"
-        Pause-Screen
-        return
-    }
-
-    Write-Host "正在安装 DeepSeek-Harness Web 测试版（npm install -g $Script:DshPkgBeta）……"
-    if ($useGlobal) {
-        & npm install -g @deepseek-ai/dsh@next
+    $ok = $true
+    try {
+        Write-Host "正在安装 pnpm（npm install -g pnpm）……"
+        & npm install -g pnpm
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "安装失败（退出码 $LASTEXITCODE）。"
-            Pause-Screen
-            return
+            Write-Host "pnpm 安装失败（退出码 $LASTEXITCODE）。"
+            $ok = $false
         }
-        Write-Host "全局安装完成。重新打开终端后可直接运行：dsh web"
+
+        if ($ok) {
+            Write-Host "正在安装 DeepSeek-Harness Web $label（npm install -g $pkgSpec）……"
+            & npm install -g $pkgSpec
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "安装失败（退出码 $LASTEXITCODE）。"
+                $ok = $false
+            }
+        }
+    } finally {
+        if ($switched) { Restore-NpmPrefix }
+    }
+
+    if (-not $ok) {
+        Pause-Screen
+        return
+    }
+
+    # 探测 dsh 实际位置；探测不到就让用户手动输入
+    $dshPath = Find-DshCommand -PrefixDir $prefixDir
+    if (-not $dshPath) {
+        Write-Host ""
+        Write-Host "未能自动探测到 dsh 命令（当前窗口 PATH 可能还没包含安装目录）。"
+        $manual = (Read-Host "请手动输入 dsh.cmd 的完整路径（回车跳过）").Trim().Trim('"').Trim()
+        if (-not [string]::IsNullOrWhiteSpace($manual)) {
+            if (Test-Path $manual) {
+                $dshPath = $manual
+                Add-UserPath -Dir (Split-Path $manual -Parent)
+            } else {
+                Write-Host "路径不存在：$manual"
+            }
+        }
+    }
+
+    Write-Host ""
+    if ($dshPath) {
+        $locPrefix = Split-Path $dshPath -Parent
+        $ver = Get-DshInstalledVersion -PrefixDir $locPrefix
+        Write-Host "dsh 命令位置：$dshPath"
+        if ($ver) { Write-Host "已安装版本：$ver" }
+        Write-Host "可直接运行：$dshPath web"
     } else {
-        New-Item -ItemType Directory -Path $customDir -Force | Out-Null
-        & npm install -g @deepseek-ai/dsh@next --prefix "$customDir"
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "安装失败（退出码 $LASTEXITCODE）。"
-            Pause-Screen
-            return
+        Write-Host "安装已完成，但未能定位 dsh 命令。"
+        if ($prefixDir) {
+            Write-Host "可尝试运行：$prefixDir\dsh.cmd web"
+        } else {
+            Write-Host "请重新打开终端后运行：dsh web"
         }
-        Write-Host "自定义目录安装完成：$customDir"
-        # 自定义目录需要添加用户环境变量；全局安装不需要
-        Add-UserPath -Dir $customDir
-        Write-Host "提示：重新打开终端后可运行 dsh 命令；也可直接运行：$customDir\dsh web"
     }
+    Write-Host "提示：重新打开终端后 PATH / NODE_PATH 才会完整生效。"
     Pause-Screen
 }
 
-# 主菜单 7：启动 dsh web
+# 主菜单 7：更新 DeepSeek-Harness Web
+# 流程约定（见 docs/12.md）：
+#   1) 先找到 dsh 装在哪（Get-Command dsh，找不到手动输入）
+#   2) 必须先把 npm prefix 切到该目录再 npm update -g；直接在 dsh 目录里更新只会 remove 掉文件，不会更新
+#   3) 更新完 npm config delete prefix 恢复
+function Upgrade-DshWeb {
+    Write-Host ""
+    Write-Host "描述：更新已安装的 DeepSeek-Harness Web（升级包流程，不清空配置）。"
+    Write-Host "注意：直接进包目录执行 npm update 只会 remove 文件、不会更新；"
+    Write-Host "      所以先 npm config set prefix 指向 dsh 所在目录，再 npm update -g。"
+    Write-Host ""
+
+    $dshPath = Find-DshCommand
+    if (-not $dshPath) {
+        Write-Host "未检测到 dsh 命令位置。"
+        $manual = (Read-Host "请手动输入 dsh.cmd 完整路径（或 dsh 所在目录，回车取消）").Trim().Trim('"').Trim()
+        if ([string]::IsNullOrWhiteSpace($manual)) {
+            Write-Host "已取消。"
+            Pause-Screen
+            return
+        }
+        if (Test-Path $manual -PathType Container) {
+            $cand = Join-Path $manual "dsh.cmd"
+            if (Test-Path $cand) { $dshPath = $cand }
+        } elseif (Test-Path $manual) {
+            $dshPath = $manual
+        }
+        if (-not $dshPath) {
+            Write-Host "未找到 dsh：$manual"
+            Pause-Screen
+            return
+        }
+    }
+
+    $prefix    = Split-Path $dshPath -Parent
+    $verBefore = Get-DshInstalledVersion -PrefixDir $prefix
+    Write-Host "dsh 位置：$dshPath"
+    Write-Host "安装目录（prefix）：$prefix"
+    Write-Host ("当前版本：" + $(if ($verBefore) { $verBefore } else { "未知" }))
+
+    $pkgSpec = $Script:DshPkgStable
+    if (Read-YesNo "是否更新到测试版 next 通道？") { $pkgSpec = $Script:DshPkgBeta }
+
+    $switched = Set-NpmPrefixTemporary -Prefix $prefix
+    if (-not $switched) {
+        Write-Host "警告：npm prefix 可能未切到 $prefix，更新结果可能不符合预期。"
+    }
+
+    $ok = $false
+    try {
+        Write-Host "正在执行：npm update -g $pkgSpec"
+        & npm update -g $pkgSpec
+        $code = $LASTEXITCODE
+        if ($code -ne 0) { Write-Host "npm update 返回码 $code。" }
+
+        $verAfter = Get-DshInstalledVersion -PrefixDir $prefix
+        if ((-not $verAfter) -or ($verAfter -eq $verBefore)) {
+            Write-Host "npm update 没有带来新版本（当前 $verAfter），改用 npm install -g $pkgSpec 强制拉取……"
+            & npm install -g $pkgSpec
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "强制更新失败（退出码 $LASTEXITCODE）。"
+            } else {
+                $verAfter = Get-DshInstalledVersion -PrefixDir $prefix
+            }
+        }
+
+        if ($verAfter -and $verAfter -ne $verBefore) {
+            Write-Host "更新完成：$verBefore -> $verAfter"
+            $ok = $true
+        } elseif ($verAfter -and $verAfter -eq $verBefore) {
+            Write-Host "已是最新版本：$verAfter"
+            $ok = $true
+        }
+    } finally {
+        if ($switched) { Restore-NpmPrefix }
+    }
+
+    if (-not $ok) { Write-Host "更新未成功，请查看上方 npm 输出。" }
+    Write-Host "更新后建议重新打开终端，或直接执行：$dshPath web"
+    Pause-Screen
+}
+
+# 主菜单 8：配置 npm 系统环境（prefix / PATH / NODE_PATH）
+function Set-NpmGlobalEnv {
+    Write-Host ""
+    Write-Host "描述：把 npm 全局安装目录写入系统环境（用户级），让全局命令随处可用。"
+    Write-Host "      包含三项：npm config set prefix、用户 PATH、用户 NODE_PATH。"
+    Write-Host ""
+    $curPrefix = Get-NpmConfigValue "prefix"
+    $curRoot   = Get-NpmGlobalRoot
+    Write-Host ("当前 npm prefix：" + $(if ($curPrefix) { $curPrefix } else { "未知" }))
+    Write-Host ("当前 npm root -g：" + $(if ($curRoot) { $curRoot } else { "未知" }))
+    Write-Host ""
+
+    $inputDir = (Read-Host "请输入 npm 全局目录（回车使用 $Script:DefaultNpmPrefix，输入 s 跳过）").Trim().Trim('"').Trim()
+    if ($inputDir -eq 's') {
+        Write-Host "已跳过。"
+        return
+    }
+    $dir = if ([string]::IsNullOrWhiteSpace($inputDir)) { $Script:DefaultNpmPrefix } else { $inputDir }
+
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Write-Host "已创建目录：$dir"
+    }
+
+    Write-Host "正在设置 npm prefix：$dir"
+    & npm config set prefix "$dir"
+    if ($LASTEXITCODE -ne 0) { Write-Host "警告：npm config set prefix 返回码 $LASTEXITCODE。" }
+
+    Add-UserPath -Dir $dir
+    Set-UserEnvVar -Name "NODE_PATH" -Value (Join-Path $dir "node_modules")
+
+    Write-Host ""
+    $nowPrefix = Get-NpmConfigValue "prefix"
+    $nowRoot   = Get-NpmGlobalRoot
+    Write-Host ("验证 npm config get prefix：" + $(if ($nowPrefix) { $nowPrefix } else { "读取失败" }))
+    Write-Host ("验证 npm root -g：" + $(if ($nowRoot) { $nowRoot } else { "读取失败" }))
+    Write-Host "提示：重新打开终端后 PATH / NODE_PATH 生效。"
+    Write-Host "      若要还原 npm 默认安装位置，执行：npm config delete prefix"
+    Write-Host "      NODE_PATH 属可选配置，若遇到模块重复加载问题可删除该用户变量。"
+}
+
+# 主菜单 9：启动 dsh web
 function Start-DshWeb {
     Write-Host ""
-    $dshCmd = Get-Command dsh -ErrorAction SilentlyContinue
-    if ($dshCmd) {
+    $dshPath = Find-DshCommand
+    if ($dshPath) {
         Write-Host "正在启动 DeepSeek-Harness Web（dsh web）……"
+        Write-Host "命令位置：$dshPath"
         Write-Host "提示：按 Ctrl+C 可停止并返回本脚本。"
-        & dsh web
+        & $dshPath web
     } else {
-        Write-Host "未检测到全局 dsh 命令，改用 npx 临时运行（首次可能需要下载）……"
+        Write-Host "未检测到 dsh 命令，改用 npx 临时运行（首次可能需要下载，不会写入全局目录）。"
         Write-Host "提示：按 Ctrl+C 可停止并返回本脚本。"
         & npx -y "@deepseek-ai/dsh" web
     }
@@ -632,13 +896,15 @@ while (-not $exitLoop) {
     $choice = Read-MenuInput "请输入你的选择"
     switch ($choice) {
         '1' { Install-DshDesktop }
-        '2' { Install-DshWebStable }
-        '3' { Install-DshWebBeta }
+        '2' { Install-DshWeb -Channel "stable" }
+        '3' { Install-DshWeb -Channel "beta" }
         '4' { Manage-Profile -Name "Desktop" -Dir $Script:DesktopDir }
         '5' { Manage-Profile -Name "Web" -Dir $Script:WebDir }
         '6' { Manage-Skills }
-        '7' { Start-DshWeb }
-        '8' { $exitLoop = $true }
+        '7' { Upgrade-DshWeb }
+        '8' { Set-NpmGlobalEnv; Pause-Screen }
+        '9' { Start-DshWeb }
+        '0' { $exitLoop = $true }
         'q' { $exitLoop = $true }
         default {
             Write-Host "无效选项：$choice，请重新输入。"

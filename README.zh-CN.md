@@ -7,10 +7,12 @@ Windows 上一键安装与管理 [DeepSeek Harness](https://www.npmjs.com/packag
 ## 功能
 
 - **安装 Desktop**：通过 winget 安装桌面客户端（稳定、推荐，无需 Node.js）
-- **安装 Web 正式版 / 测试版**：自动检查并安装 Node.js，配置 npm `allow-scripts`，安装 pnpm，支持全局或自定义目录安装（自动添加用户 PATH）
+- **安装 Web 正式版 / 测试版**：自动检查并安装 Node.js，配置 npm `allow-scripts`，安装 pnpm；自定义目录走 `npm config set prefix`（绝不传 `--prefix`，实测会损坏文件），装完 `npm config delete prefix` 恢复，并写入 PATH / NODE_PATH、探测 `dsh` 实际位置
+- **更新 DSH Web**：先定位已安装的 `dsh`，再把 `npm config set prefix` 指向其目录并执行 `npm update -g`，最后恢复 npm prefix（直接在包目录里更新只会 remove 文件）
+- **npm 系统环境**：一步配置 npm `prefix`、用户 PATH 与 NODE_PATH
 - **插件管理**：管理 Desktop / Web 的 profile（`%USERPROFILE%\.dsh\profiles\desktop|web`），支持安装 / 卸载 / 一键更新 / 查看列表，可直接用记事本打开 `cordis.patch.yml` 和 `package.json`
 - **Skill 管理**：从 ZIP（自动解压、识别单顶层文件夹）或文件夹安装到 `%USERPROFILE%\.dsh\skills`，支持删除 / 列表
-- **启动 Web**：优先 `dsh web`，未检测到时自动回退 `npx`
+- **启动 Web**：优先 `dsh web`（通过 `Get-Command dsh` 与常见 prefix 目录探测），未检测到时自动回退 `npx`
 - 中文描述 + 英文选项；每个操作结束后停顿显示结果，按回车返回菜单
 
 ## 环境要求

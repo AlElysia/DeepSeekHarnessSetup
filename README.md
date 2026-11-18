@@ -7,10 +7,12 @@ One-click installer and manager for [DeepSeek Harness](https://www.npmjs.com/pac
 ## Features
 
 - 🖥️ **Install Desktop** — via winget (stable, recommended; no Node.js needed)
-- 🌐 **Install Web Stable / Beta** — via npm + pnpm (auto-checks Node.js, configures npm `allow-scripts`, installs pnpm, supports global or custom-directory install with user PATH setup)
+- 🌐 **Install Web Stable / Beta** — via npm + pnpm (auto-checks Node.js, configures npm `allow-scripts`, installs pnpm; custom directory install goes through `npm config set prefix` — never `--prefix` — then `npm config delete prefix` afterwards, with PATH / NODE_PATH setup and `dsh` location detection)
+- ⬆️ **Upgrade DSH Web** — locates the installed `dsh`, temporarily points `npm config set prefix` at it, runs `npm update -g`, then restores the npm prefix
+- 🛠️ **npm Global Environment** — configure npm `prefix`, user PATH and NODE_PATH in one step
 - 🧩 **Plugin Management** — for Desktop & Web profiles (`%USERPROFILE%\.dsh\profiles\desktop|web`): install / remove / upgrade / list, open `cordis.patch.yml` and `package.json` in Notepad
 - 🎯 **Skill Management** — install from ZIP (auto-extract, single-top-folder aware) or folder copy; remove / list skills in `%USERPROFILE%\.dsh\skills`
-- 🚀 **Start DSH Web** — `dsh web` with automatic `npx` fallback
+- 🚀 **Start DSH Web** — `dsh web` (resolved via `Get-Command dsh` / known prefixes) with automatic `npx` fallback
 - 中文 descriptions with English menu options; every action pauses so you can read the output
 
 ## Menu
@@ -22,8 +24,10 @@ One-click installer and manager for [DeepSeek Harness](https://www.npmjs.com/pac
 4. DeepSeek-Harness Desktop Management  (Plugins)
 5. DeepSeek-Harness Web Management      (Plugins)
 6. DeepSeek-Harness Skill Management
-7. Start DSH Web
-8. Quit
+7. Upgrade DSH Web                      (npm update -g)
+8. Configure npm Global Environment     (prefix / PATH / NODE_PATH)
+9. Start DSH Web
+0. Quit
 ```
 
 ## Requirements
@@ -31,6 +35,7 @@ One-click installer and manager for [DeepSeek Harness](https://www.npmjs.com/pac
 - Windows 10 / 11 with Windows PowerShell 5.1 or later (built in)
 - [winget](https://aka.ms/getwinget) (App Installer) — for Desktop / Node.js install
 - Node.js — for Web install; option 2/3 auto-installs it via winget if missing
+- npm — used for Web install/upgrade; the script never passes `--prefix` to `npm install` (it corrupts the install) and always restores the npm prefix afterwards
 
 ## Quick Start
 
