@@ -496,9 +496,16 @@ function Install-DshWeb {
 
     Write-Host ""
     Write-Host "描述：安装 DeepSeek-Harness Web $label。"
-    Write-Host "流程：检查 Node.js -> 允许包脚本 -> 检查 pnpm（默认目录，已装则跳过）-> 询问是否自定义安装目录 ->"
+    Write-Host "流程：检查 Node.js -> 询问是否自定义安装目录 -> 允许包脚本 -> 检查 pnpm（默认目录，已装则跳过）->"
     Write-Host "      自定义才 npm config set prefix -> 安装 dsh -> 恢复 npm config 原配置 -> 写入 PATH/NODE_PATH -> 探测 dsh 位置。"
     if (-not (Ensure-NodeJs)) { Pause-Screen; return }
+
+    # 先问清楚装到哪：自定义目录（默认 C:\npm-global）或 npm 默认位置
+    $prefixDir = $null
+    if (Read-YesNo "是否使用自定义安装目录（默认 $Script:DefaultNpmPrefix，n 表示使用 npm 默认位置）？") {
+        $inputDir = (Read-Host "请输入安装目录（直接回车使用 $Script:DefaultNpmPrefix）").Trim().Trim('"').Trim()
+        $prefixDir = if ([string]::IsNullOrWhiteSpace($inputDir)) { $Script:DefaultNpmPrefix } else { $inputDir }
+    }
 
     if (-not (Read-YesNo "是否允许执行 @pnpm 和 @deepseek-ai/dsh 两个包的安装脚本？")) {
         Write-Host "已拒绝执行包脚本，返回主菜单（不安装）。"
@@ -517,13 +524,6 @@ function Install-DshWeb {
         return
     }
     Add-UserPath -Dir (Split-Path $pnpmPath -Parent)
-
-    # 安装目录：自定义目录（默认 C:\npm-global）或 npm 默认位置
-    $prefixDir = $null
-    if (Read-YesNo "是否使用自定义安装目录（默认 $Script:DefaultNpmPrefix，n 表示使用 npm 默认位置）？") {
-        $inputDir = (Read-Host "请输入安装目录（直接回车使用 $Script:DefaultNpmPrefix）").Trim().Trim('"').Trim()
-        $prefixDir = if ([string]::IsNullOrWhiteSpace($inputDir)) { $Script:DefaultNpmPrefix } else { $inputDir }
-    }
 
     # 只有选了自定义目录才动 npm prefix；否则直接装进 npm 默认位置
     $switched = $false
@@ -655,7 +655,13 @@ function Upgrade-DshWeb {
 
         $verAfter = Get-DshInstalledVersion -PrefixDir $prefix
         if ((-not $verAfter) -or ($verAfter -eq $verBefore)) {
-            Write-Host "npm update 没有带来新版本（当前 $verAfter），改用 npm install -g $pkgSpec 强制拉取……"
+            Write-Host "npm update 没有带来新版本（当前 $verAfter），改用 npm upgrade -g $pkgSpec……"
+            & npm upgrade -g $pkgSpec
+            if ($LASTEXITCODE -ne 0) { Write-Host "npm upgrade 返回码 $LASTEXITCODE。" }
+            $verAfter = Get-DshInstalledVersion -PrefixDir $prefix
+        }
+        if ((-not $verAfter) -or ($verAfter -eq $verBefore)) {
+            Write-Host "npm upgrade 仍未带来新版本（当前 $verAfter），改用 npm install -g $pkgSpec 强制拉取……"
             & npm install -g $pkgSpec
             if ($LASTEXITCODE -ne 0) {
                 Write-Host "强制更新失败（退出码 $LASTEXITCODE）。"
