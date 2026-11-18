@@ -482,11 +482,12 @@ function Install-DshDesktop {
 
 # 主菜单 2 / 3：安装 DeepSeek-Harness Web（正式版 / 测试版）
 # 流程约定（见 docs/12.md）：
-#   1) 绝不给 npm install 传 --prefix 参数（实测会损坏文件）
-#   2) 先用 npm config set prefix 把全局目录切到目标位置，装完再 npm config delete prefix 恢复
-#   3) 装完用 Get-Command dsh 探测命令位置，探测不到再让用户手动输入
-#   4) 自定义目录同时写入用户 PATH（全局 bin）与 NODE_PATH（全局 node_modules）
-#   5) pnpm 是共用工具，必须装在 npm 默认全局目录（切换 prefix 之前装）；已安装则直接跳过，
+#   1) 一开始就问清楚装到哪：自定义目录（默认 C:\npm-global）或 npm 默认位置
+#   2) 绝不给 npm install 传 --prefix 参数（实测会损坏文件）
+#   3) 只有自定义目录才 npm config set prefix，装完恢复成安装前的 npm config
+#   4) 安装目录写入用户 PATH（全局 bin）与 NODE_PATH（全局 node_modules）
+#   5) 安装不做 dsh 路径探测：装到哪个目录是已知的，直接按该目录给出运行命令
+#   6) pnpm 是共用工具，必须装在 npm 默认全局目录（切换 prefix 之前装）；已安装则直接跳过，
 #      既不重复安装，也不会跟着 dsh 的自定义目录跑掉
 function Install-DshWeb {
     param([ValidateSet("stable", "beta")][string]$Channel = "stable")
@@ -497,7 +498,7 @@ function Install-DshWeb {
     Write-Host ""
     Write-Host "描述：安装 DeepSeek-Harness Web $label。"
     Write-Host "流程：检查 Node.js -> 询问是否自定义安装目录 -> 允许包脚本 -> 检查 pnpm（默认目录，已装则跳过）->"
-    Write-Host "      自定义才 npm config set prefix -> 安装 dsh -> 恢复 npm config 原配置 -> 写入 PATH/NODE_PATH -> 探测 dsh 位置。"
+    Write-Host "      自定义才 npm config set prefix -> 安装 dsh -> 恢复 npm config 原配置 -> 写入 PATH/NODE_PATH。"
     if (-not (Ensure-NodeJs)) { Pause-Screen; return }
 
     # 先问清楚装到哪：自定义目录（默认 C:\npm-global）或 npm 默认位置
@@ -559,44 +560,20 @@ function Install-DshWeb {
     # 全局 bin 目录进 PATH，全局模块目录进 NODE_PATH
     Set-NpmEnvVars -Dir $targetPrefix
 
-    # 探测 dsh 实际位置：先看目标目录里的 dsh.cmd，再看 PATH / 常见目录
-    $dshPath = $null
-    $cand = Join-Path $targetPrefix "dsh.cmd"
-    if (Test-Path $cand) { $dshPath = $cand }
-    if (-not $dshPath) { $dshPath = Find-DshCommand -PrefixDir $targetPrefix }
-    if (-not $dshPath) {
-        Write-Host ""
-        Write-Host "未能自动探测到 dsh 命令（当前窗口 PATH 可能还没包含安装目录）。"
-        $manual = (Read-Host "请手动输入 dsh.cmd 的完整路径（回车跳过）").Trim().Trim('"').Trim()
-        if (-not [string]::IsNullOrWhiteSpace($manual)) {
-            if (Test-Path $manual) {
-                $dshPath = $manual
-                Add-UserPath -Dir (Split-Path $manual -Parent)
-            } else {
-                Write-Host "路径不存在：$manual"
-            }
-        }
-    }
-
+    # 安装不做路径探测：装到哪个目录是已知的，直接按该目录给出结果
+    $ver = Get-DshInstalledVersion -PrefixDir $targetPrefix
     Write-Host ""
-    if ($dshPath) {
-        $locPrefix = Split-Path $dshPath -Parent
-        $ver = Get-DshInstalledVersion -PrefixDir $locPrefix
-        Write-Host "dsh 命令位置：$dshPath"
-        if ($ver) { Write-Host "已安装版本：$ver" }
-        Write-Host "可直接运行：$dshPath web"
-    } else {
-        Write-Host "安装已完成，但未能定位 dsh 命令。"
-        Write-Host "可尝试运行：$targetPrefix\dsh.cmd web"
-    }
+    Write-Host "安装完成，安装目录：$targetPrefix"
+    if ($ver) { Write-Host "已安装版本：$ver" }
+    Write-Host "可直接运行：$targetPrefix\dsh.cmd web"
     Write-Host "提示：重新打开终端后 PATH / NODE_PATH 才会完整生效。"
     Pause-Screen
 }
 
 # 主菜单 7：更新 DeepSeek-Harness Web
 # 流程约定（见 docs/12.md）：
-#   1) 先确认 dsh 装在哪：Get-Command dsh -> 各全局目录下的 node_modules\@deepseek-ai\dsh
-#      都找不到再让用户输入目录（输入 dsh.cmd 路径则取其所在目录）
+#   1) dsh 在 npm 默认全局目录时不需要探测，直接更新；只有装在自定义（非默认）目录，
+#      才去 Get-Command / 各全局目录的 node_modules\@deepseek-ai\dsh 里找，仍找不到再让用户输入目录
 #   2) 必须先把 npm prefix 切到该目录再 npm update -g；直接在 dsh 目录里更新只会 remove 掉文件，不会更新
 #   3) 更新完恢复 npm config 为更新前的配置，并同步 PATH / NODE_PATH
 #   4) pnpm 属共用工具，更新 dsh 时不动它
@@ -608,23 +585,33 @@ function Upgrade-DshWeb {
     Write-Host "      更新完把 npm config 恢复成更新前的配置。"
     Write-Host ""
 
-    # 先确认 dsh 到底装在哪里（PATH 里没有也能从 node_modules 认出来）
-    $prefix = Find-DshInstallPrefix
-    if (-not $prefix) {
-        Write-Host "未在 PATH 与常见全局目录里找到已安装的 dsh。"
-        Write-Host "已检查：当前 npm prefix、npm root -g、$Script:DefaultNpmPrefix、%APPDATA%\npm、%ProgramFiles%\nodejs"
-        $manual = (Read-Host "请输入 dsh 安装目录（含 node_modules 的全局目录；也可直接给 dsh.cmd 路径，回车取消）").Trim().Trim('"').Trim()
-        if ([string]::IsNullOrWhiteSpace($manual)) {
-            Write-Host "已取消。"
-            Pause-Screen
-            return
-        }
-        if ((Test-Path $manual) -and -not (Test-Path $manual -PathType Container)) {
-            $manual = Split-Path $manual -Parent
-        }
-        $prefix = $manual
-        if (-not (Get-DshInstalledVersion -PrefixDir $prefix)) {
-            Write-Host "警告：$prefix 下没有 node_modules\@deepseek-ai\dsh，仍按该目录继续。"
+    # dsh 在 npm 默认全局目录时不需要探测，直接更新；
+    # 只有装在自定义（非默认）目录时，才去找它到底在哪
+    $defaultPrefix = Get-DefaultNpmPrefix
+    $prefix = $null
+    if (Get-DshInstalledVersion -PrefixDir $defaultPrefix) {
+        $prefix = $defaultPrefix
+        Write-Host "dsh 位于 npm 默认全局目录：$prefix"
+    } else {
+        Write-Host "dsh 不在 npm 默认全局目录（$defaultPrefix），开始查找自定义安装路径……"
+        $prefix = Find-DshInstallPrefix
+        if ($prefix) {
+            Write-Host "已定位到自定义安装路径：$prefix"
+        } else {
+            Write-Host "未在 PATH 与常见全局目录里找到已安装的 dsh。"
+            $manual = (Read-Host "请输入 dsh 安装目录（含 node_modules 的全局目录；也可直接给 dsh.cmd 路径，回车取消）").Trim().Trim('"').Trim()
+            if ([string]::IsNullOrWhiteSpace($manual)) {
+                Write-Host "已取消。"
+                Pause-Screen
+                return
+            }
+            if ((Test-Path $manual) -and -not (Test-Path $manual -PathType Container)) {
+                $manual = Split-Path $manual -Parent
+            }
+            $prefix = $manual
+            if (-not (Get-DshInstalledVersion -PrefixDir $prefix)) {
+                Write-Host "警告：$prefix 下没有 node_modules\@deepseek-ai\dsh，仍按该目录继续。"
+            }
         }
     }
 
