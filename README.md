@@ -12,7 +12,6 @@ One-click installer and manager for [DeepSeek Harness](https://www.npmjs.com/pac
 - 🧩 **Plugin Management** — for Desktop & Web profiles (`%USERPROFILE%\.dsh\profiles\desktop|web`): install / remove / upgrade / list, open `cordis.patch.yml` and `package.json` in Notepad
 - 🎯 **Skill Management** — install from ZIP (auto-extract, single-top-folder aware) or folder copy; remove / list skills in `%USERPROFILE%\.dsh\skills`
 - 🚀 **Start DSH Web** — `dsh web` (resolved via `Get-Command dsh` / known prefixes) with automatic `npx` fallback
-- 中文 descriptions with English menu options; every action pauses so you can read the output
 
 ## Menu
 

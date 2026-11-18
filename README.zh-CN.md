@@ -12,7 +12,6 @@ Windows 上一键安装与管理 [DeepSeek Harness](https://www.npmjs.com/packag
 - **插件管理**：管理 Desktop / Web 的 profile（`%USERPROFILE%\.dsh\profiles\desktop|web`），支持安装 / 卸载 / 一键更新 / 查看列表，可直接用记事本打开 `cordis.patch.yml` 和 `package.json`
 - **Skill 管理**：从 ZIP（自动解压、识别单顶层文件夹）或文件夹安装到 `%USERPROFILE%\.dsh\skills`，支持删除 / 列表
 - **启动 Web**：优先 `dsh web`（通过 `Get-Command dsh` 与常见 prefix 目录探测），未检测到时自动回退 `npx`
-- 中文描述 + 英文选项；每个操作结束后停顿显示结果，按回车返回菜单
 
 ## 环境要求
 
