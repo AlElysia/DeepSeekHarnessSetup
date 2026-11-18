@@ -32,7 +32,9 @@ $Script:DshPkgBeta   = "@deepseek-ai/dsh@next"
 $Script:DefaultNpmPrefix = "C:\npm-global"
 
 # 安装 / 更新期间临时切换的 npm prefix 原值（结束后据此恢复）
-$Script:NpmPrefixBefore = $null
+$Script:NpmPrefixBefore  = $null
+# 是否真的动过 npm prefix（动过才恢复，避免误删用户原有配置）
+$Script:NpmPrefixTouched = $false
 
 # 目录约定：工作目录 %USERPROFILE%，DSH 数据目录 %USERPROFILE%\.dsh
 $Script:UserProfileDir = $env:USERPROFILE
@@ -106,6 +108,16 @@ function Set-UserEnvVar {
     }
 }
 
+# 比较两个路径是否等价（忽略大小写、引号与结尾反斜杠）
+function Test-SamePath {
+    param([string]$A, [string]$B)
+    if ([string]::IsNullOrWhiteSpace($A) -and [string]::IsNullOrWhiteSpace($B)) { return $true }
+    if ([string]::IsNullOrWhiteSpace($A) -or [string]::IsNullOrWhiteSpace($B)) { return $false }
+    $na = $A.Trim().Trim('"').TrimEnd('\')
+    $nb = $B.Trim().Trim('"').TrimEnd('\')
+    return ($na -ieq $nb)
+}
+
 # 读取 npm 配置项（失败或未设置时返回 $null）
 function Get-NpmConfigValue {
     param([string]$Key)
@@ -169,11 +181,80 @@ function Find-DshCommand {
     return $null
 }
 
+# 探测 pnpm 是否已安装：Get-Command -> 当前 npm prefix -> npm root -g 上一级 -> 默认目录
+# 注意：pnpm 是 Desktop / Web / 插件共用的独立工具，应待在 npm 默认全局目录，不随 dsh 的自定义前缀走
+function Find-PnpmCommand {
+    $cmd = Get-Command pnpm -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) {
+        $cmdDir  = Split-Path $cmd.Source -Parent
+        $cmdFile = Join-Path $cmdDir "pnpm.cmd"
+        if (Test-Path $cmdFile) { return $cmdFile }
+        return $cmd.Source
+    }
+
+    $dirs = New-Object System.Collections.Generic.List[string]
+    $npmPrefix = Get-NpmConfigValue "prefix"
+    if ($npmPrefix) { $dirs.Add($npmPrefix) }
+    $npmRoot = Get-NpmGlobalRoot
+    if ($npmRoot) { $dirs.Add((Split-Path $npmRoot -Parent)) }
+    $dirs.Add($Script:DefaultNpmPrefix)
+
+    foreach ($dir in $dirs) {
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        foreach ($name in @("pnpm.cmd", "pnpm.exe", "pnpm.ps1", "pnpm")) {
+            $cand = Join-Path $dir $name
+            if (Test-Path $cand) { return $cand }
+        }
+    }
+    return $null
+}
+
+# 读取 pnpm 版本（读不到返回 $null）
+function Get-PnpmVersion {
+    param([string]$PnpmPath)
+    if ([string]::IsNullOrWhiteSpace($PnpmPath)) { return $null }
+    $out = & $PnpmPath -v 2>$null
+    $v = ([string](@($out) -join "")).Trim()
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    return $v
+}
+
+# 确保 pnpm 可用：已安装则跳过（不重复安装、不装进自定义目录）；未安装则用 npm 默认全局目录安装
+function Ensure-Pnpm {
+    $pnpmPath = Find-PnpmCommand
+    if ($pnpmPath) {
+        $ver = Get-PnpmVersion -PnpmPath $pnpmPath
+        Write-Host ("已检测到 pnpm" + $(if ($ver) { "（$ver）" } else { "" }) + "：$pnpmPath，跳过安装。")
+        return $pnpmPath
+    }
+
+    Write-Host "未检测到 pnpm，正在用 npm 默认全局目录安装（不切换 prefix，避免装进自定义目录）……"
+    & npm install -g pnpm
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "pnpm 安装失败（退出码 $LASTEXITCODE）。"
+        return $null
+    }
+    $pnpmPath = Find-PnpmCommand
+    if ($pnpmPath) {
+        $ver = Get-PnpmVersion -PnpmPath $pnpmPath
+        Write-Host ("pnpm 安装完成" + $(if ($ver) { "（$ver）" } else { "" }) + "：$pnpmPath")
+        return $pnpmPath
+    }
+
+    # 刚装完但当前窗口 PATH 尚未刷新：按 npm 全局目录推断位置，返回给上层写 PATH
+    $npmPrefix = Get-NpmConfigValue "prefix"
+    if (-not $npmPrefix) { $npmPrefix = $Script:DefaultNpmPrefix }
+    $expected = Join-Path $npmPrefix "pnpm.cmd"
+    Write-Host "pnpm 安装命令已执行，但当前窗口尚未刷新 PATH；预计位置：$expected（重开终端后可用）。"
+    return $expected
+}
+
 # 临时把 npm prefix 切到指定目录（等于 npm config set prefix），原值存入 $Script:NpmPrefixBefore
 function Set-NpmPrefixTemporary {
     param([string]$Prefix)
     if ([string]::IsNullOrWhiteSpace($Prefix)) { return $false }
-    $Script:NpmPrefixBefore = Get-NpmConfigValue "prefix"
+    $Script:NpmPrefixBefore  = Get-NpmConfigValue "prefix"
+    $Script:NpmPrefixTouched = $true
     if (-not (Test-Path $Prefix)) {
         New-Item -ItemType Directory -Path $Prefix -Force | Out-Null
         Write-Host "已创建安装目录：$Prefix"
@@ -189,19 +270,32 @@ function Set-NpmPrefixTemporary {
     return ($now.TrimEnd('\') -ieq $Prefix.TrimEnd('\'))
 }
 
-# 恢复安装 / 更新前的 npm prefix（用户级无配置时等价于 npm config delete prefix）
+# 恢复安装 / 更新前的 npm 配置：先 npm config delete prefix，再保证结果与安装前完全一致
 function Restore-NpmPrefix {
     $before = $Script:NpmPrefixBefore
+    $Script:NpmPrefixBefore  = $null
+    $Script:NpmPrefixTouched = $false
+
+    $now = Get-NpmConfigValue "prefix"
+    if ((Test-SamePath $now $before) -and -not [string]::IsNullOrWhiteSpace($before)) {
+        Write-Host "npm prefix 保持安装前配置：$now（未做改动）"
+        return
+    }
+
     Write-Host "正在恢复 npm prefix（npm config delete prefix）……"
     & npm config delete prefix 2>$null | Out-Null
-    $now = Get-NpmConfigValue "prefix"
-    if ($before -and $now -and ($now.TrimEnd('\') -ine $before.TrimEnd('\'))) {
+    $default = Get-NpmConfigValue "prefix"
+
+    if ($before -and -not (Test-SamePath $before $default)) {
         & npm config set prefix "$before" 2>$null | Out-Null
-        Write-Host "已恢复原有 npm prefix：$before"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "警告：恢复 npm config set prefix 返回码 $LASTEXITCODE。"
+        }
+        $restored = Get-NpmConfigValue "prefix"
+        Write-Host "已恢复安装前的 npm prefix：$before（当前：$restored）"
     } else {
-        Write-Host "npm prefix 已恢复默认：$now"
+        Write-Host ("npm prefix 已恢复为默认配置：" + $(if ($default) { $default } else { "读取失败" }))
     }
-    $Script:NpmPrefixBefore = $null
 }
 
 # ============================ 菜单显示 ============================
@@ -350,6 +444,8 @@ function Install-DshDesktop {
 #   2) 先用 npm config set prefix 把全局目录切到目标位置，装完再 npm config delete prefix 恢复
 #   3) 装完用 Get-Command dsh 探测命令位置，探测不到再让用户手动输入
 #   4) 自定义目录同时写入用户 PATH（全局 bin）与 NODE_PATH（全局 node_modules）
+#   5) pnpm 是共用工具，必须装在 npm 默认全局目录（切换 prefix 之前装）；已安装则直接跳过，
+#      既不重复安装，也不会跟着 dsh 的自定义目录跑掉
 function Install-DshWeb {
     param([ValidateSet("stable", "beta")][string]$Channel = "stable")
 
@@ -358,8 +454,8 @@ function Install-DshWeb {
 
     Write-Host ""
     Write-Host "描述：安装 DeepSeek-Harness Web $label。"
-    Write-Host "流程：检查 Node.js -> 允许包脚本 -> 选择安装目录 -> npm config set prefix ->"
-    Write-Host "      安装 pnpm 与 dsh -> npm config delete prefix -> 探测 dsh 位置 -> 写入 PATH/NODE_PATH。"
+    Write-Host "流程：检查 Node.js -> 允许包脚本 -> 检查 pnpm（默认目录，已装则跳过）-> 选择安装目录 ->"
+    Write-Host "      npm config set prefix -> 安装 dsh -> 恢复 npm prefix 原配置 -> 探测 dsh 位置 -> 写入 PATH/NODE_PATH。"
     if (-not (Ensure-NodeJs)) { Pause-Screen; return }
 
     if (-not (Read-YesNo "是否允许执行 @pnpm 和 @deepseek-ai/dsh 两个包的安装脚本？")) {
@@ -368,6 +464,17 @@ function Install-DshWeb {
         return
     }
     Set-NpmAllowScripts
+
+    # 先把 pnpm 落实好：此时 npm prefix 还是用户原来的（默认）配置，
+    # pnpm 因此装在默认全局目录，不会被后面的自定义 prefix 带跑；
+    # 已经装了 pnpm 就直接跳过，避免出现两套 pnpm 互相打架。
+    $pnpmPath = Ensure-Pnpm
+    if (-not $pnpmPath) {
+        Write-Host "pnpm 不可用，已中止安装（dsh 的插件管理依赖 pnpm）。"
+        Pause-Screen
+        return
+    }
+    Add-UserPath -Dir (Split-Path $pnpmPath -Parent)
 
     # 安装目录：自定义目录（默认 C:\npm-global）或 npm 默认位置
     $prefixDir = $null
@@ -390,23 +497,15 @@ function Install-DshWeb {
 
     $ok = $true
     try {
-        Write-Host "正在安装 pnpm（npm install -g pnpm）……"
-        & npm install -g pnpm
+        Write-Host "正在安装 DeepSeek-Harness Web $label（npm install -g $pkgSpec）……"
+        & npm install -g $pkgSpec
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "pnpm 安装失败（退出码 $LASTEXITCODE）。"
+            Write-Host "安装失败（退出码 $LASTEXITCODE）。"
             $ok = $false
         }
-
-        if ($ok) {
-            Write-Host "正在安装 DeepSeek-Harness Web $label（npm install -g $pkgSpec）……"
-            & npm install -g $pkgSpec
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "安装失败（退出码 $LASTEXITCODE）。"
-                $ok = $false
-            }
-        }
     } finally {
-        if ($switched) { Restore-NpmPrefix }
+        # 只要动过 npm prefix 就恢复成安装前配置（含异常中断的情况）
+        if ($Script:NpmPrefixTouched) { Restore-NpmPrefix }
     }
 
     if (-not $ok) {
@@ -453,7 +552,8 @@ function Install-DshWeb {
 # 流程约定（见 docs/12.md）：
 #   1) 先找到 dsh 装在哪（Get-Command dsh，找不到手动输入）
 #   2) 必须先把 npm prefix 切到该目录再 npm update -g；直接在 dsh 目录里更新只会 remove 掉文件，不会更新
-#   3) 更新完 npm config delete prefix 恢复
+#   3) 更新完 npm config delete prefix，并把 npm prefix 恢复成更新前的配置
+#   4) pnpm 属共用工具，更新 dsh 时不动它
 function Upgrade-DshWeb {
     Write-Host ""
     Write-Host "描述：更新已安装的 DeepSeek-Harness Web（升级包流程，不清空配置）。"
@@ -523,7 +623,8 @@ function Upgrade-DshWeb {
             $ok = $true
         }
     } finally {
-        if ($switched) { Restore-NpmPrefix }
+        # 更新完把 npm prefix 恢复成更新前配置
+        if ($Script:NpmPrefixTouched) { Restore-NpmPrefix }
     }
 
     if (-not $ok) { Write-Host "更新未成功，请查看上方 npm 输出。" }

@@ -7,8 +7,8 @@ One-click installer and manager for [DeepSeek Harness](https://www.npmjs.com/pac
 ## Features
 
 - 🖥️ **Install Desktop** — via winget (stable, recommended; no Node.js needed)
-- 🌐 **Install Web Stable / Beta** — via npm + pnpm (auto-checks Node.js, configures npm `allow-scripts`, installs pnpm; custom directory install goes through `npm config set prefix` — never `--prefix` — then `npm config delete prefix` afterwards, with PATH / NODE_PATH setup and `dsh` location detection)
-- ⬆️ **Upgrade DSH Web** — locates the installed `dsh`, temporarily points `npm config set prefix` at it, runs `npm update -g`, then restores the npm prefix
+- 🌐 **Install Web Stable / Beta** — via npm + pnpm (auto-checks Node.js, configures npm `allow-scripts`; pnpm is checked first — already installed means skipped, otherwise it is installed into the npm default global directory *before* the prefix switch, so it never ends up inside the custom dsh directory; the custom directory install then goes through `npm config set prefix` — never `--prefix` — with PATH / NODE_PATH setup and `dsh` location detection)
+- ⬆️ **Upgrade DSH Web** — locates the installed `dsh`, temporarily points `npm config set prefix` at it, runs `npm update -g`, then restores the npm prefix to exactly the pre-upgrade value
 - 🛠️ **npm Global Environment** — configure npm `prefix`, user PATH and NODE_PATH in one step
 - 🧩 **Plugin Management** — for Desktop & Web profiles (`%USERPROFILE%\.dsh\profiles\desktop|web`): install / remove / upgrade / list, open `cordis.patch.yml` and `package.json` in Notepad
 - 🎯 **Skill Management** — install from ZIP (auto-extract, single-top-folder aware) or folder copy; remove / list skills in `%USERPROFILE%\.dsh\skills`
@@ -35,7 +35,7 @@ One-click installer and manager for [DeepSeek Harness](https://www.npmjs.com/pac
 - Windows 10 / 11 with Windows PowerShell 5.1 or later (built in)
 - [winget](https://aka.ms/getwinget) (App Installer) — for Desktop / Node.js install
 - Node.js — for Web install; option 2/3 auto-installs it via winget if missing
-- npm — used for Web install/upgrade; the script never passes `--prefix` to `npm install` (it corrupts the install) and always restores the npm prefix afterwards
+- npm — used for Web install/upgrade; the script never passes `--prefix` to `npm install` (it corrupts the install), and afterwards restores the npm prefix to exactly the pre-install configuration: `npm config delete prefix` when it was unset (default), or `npm config set prefix <old value>` when a custom value existed
 
 ## Quick Start
 
